@@ -132,7 +132,7 @@ def _get_flexdist_cutoff_func(rec, ligand, flexdist, mode, pocket_cutoff):  # mo
             raise NotImplementedError(f"The distancec metric {mode} is not implemented.")
 
 def get_complex_graph(
-    receptor_model, 
+    receptor_model,
     lm_embedding_chains, # list
     ligand, # rdkit Mol
     ligand_id, # str
@@ -227,7 +227,7 @@ def get_complex_graph(
     complex_graph['ligand'].pos -= protein_center
     complex_graph.original_center = protein_center
 
-    return complex_graph, ligand
+    return complex_graph
 
 @ensure_device
 def compute_ESM_embeddings(model, alphabet, labels, sequences, device=None):
@@ -378,12 +378,21 @@ class AutoDiffDocker:
             flexible_sidechains=score_model_args.flexible_sidechains
         )
 
-    def sample_single_graph(self, complex_graph, batch_size=5):
+    def sample_single_graph(self, complex_graph):
         complex_graph_copy = deepcopy(complex_graph)
         self._randomize_position([complex_graph_copy])
         result_data_list, confidence = self._sampling(
             data_list=[complex_graph_copy],
-            batch_size = batch_size
+            batch_size = 1
+        )
+        return result_data_list, confidence
+    
+    def sample_multiple_graphs(self, complex_graphs, batch_size=5):
+        complex_graphs_copy = deepcopy(complex_graphs)
+        self._randomize_position(complex_graphs_copy)
+        result_data_list, confidence = self._sampling(
+            data_list=complex_graphs_copy,
+            batch_size=batch_size
         )
         return result_data_list, confidence
 
