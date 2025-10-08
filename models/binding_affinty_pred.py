@@ -1,5 +1,4 @@
-import traceback
-
+import math
 from e3nn import o3
 import torch
 from torch import nn
@@ -8,8 +7,9 @@ from torch_cluster import radius, radius_graph, knn_graph
 from torch_scatter import scatter_mean
 import numpy as np
 
-from models.score_model import OldAtomEncoder, TensorProductConvLayer, GaussianSmearing, AtomEncoder
-from utils import so3, torus
+from models.score_model import TensorProductConvLayer, GaussianSmearing #, AtomEncoder
+# The best model is using the old atom encoder
+from models.score_model import OldAtomEncoder as AtomEncoder
 from datasets.process_mols import lig_feature_dims, rec_residue_feature_dims, rec_atom_feature_dims
 
 AGGREGATORS = {"mean": lambda x: torch.mean(x, dim=1),
@@ -17,9 +17,45 @@ AGGREGATORS = {"mean": lambda x: torch.mean(x, dim=1),
                "min": lambda x: torch.min(x, dim=1)[0],
                "std": lambda x: torch.std(x, dim=1)}
 
+# Default sinusoidal embedding function
+def sinusoidal_embedding(timesteps, dim=32, scale=10000, max_positions=10000):
+    """ from https://github.com/hojonathanho/diffusion/blob/master/diffusion_tf/nn.py   """
+    assert len(timesteps.shape) == 1
+    half_dim = dim // 2
+    emb = math.log(max_positions) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=timesteps.device) * -emb)
+    emb = scale * timesteps.float()[:, None] * emb[None, :]
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+    if dim % 2 == 1:  # zero pad
+        emb = F.pad(emb, (0, 1), mode='constant')
+    assert emb.shape == (timesteps.shape[0], dim)
+    return emb
 
+# For loading the best model weights
+# affinity_pred = AffinityPredModel(
+#     device='cuda', 
+#     cross_max_distance=80,
+#     dynamic_max_cross=True,
+#     ns=24,
+#     nv=6,
+#     norm_by_sigma=False,
+#     num_conv_layers=5,
+#     atom_max_neighbors=8,
+#     flexible_sidechains=True,
+#     sh_lmax=1,
+#     lm_embedding_type='esm',
+# )
+
+# state_dict = torch.load(
+#     f'{base_model_dir}/confidence_model/best_model.pt', 
+#     map_location=torch.device('cpu')
+# )
+
+# affinity_pred.load_state_dict(state_dict, strict=True)
+# affinity_pred = affinity_pred.to(device)
+# affinity_pred.eval()
 class TensorProductScoreModel(torch.nn.Module):
-    def __init__(self, device, timestep_emb_func, in_lig_edge_features=4, sigma_embed_dim=32, sh_lmax=2,
+    def __init__(self, device, in_lig_edge_features=4, sigma_embed_dim=32, sh_lmax=2,
                  ns=16, nv=4, num_conv_layers=2, lig_max_radius=5, rec_max_radius=30, cross_max_distance=250,
                  center_max_distance=30, distance_embed_dim=32, cross_distance_embed_dim=32, no_torsion=False,
                  scale_by_sigma=True, norm_by_sigma=True, use_second_order_repr=False, batch_norm=True,
@@ -29,7 +65,7 @@ class TensorProductScoreModel(torch.nn.Module):
                  asyncronous_noise_schedule=False, affinity_prediction=False, parallel=1,
                  parallel_aggregators="mean max min std", num_confidence_outputs=1, fixed_center_conv=False,
                  atom_max_neighbors=None,
-                 no_aminoacid_identities=False, flexible_sidechains=False, use_old_atom_encoder=False):
+                 no_aminoacid_identities=False, flexible_sidechains=False):
         super(TensorProductScoreModel, self).__init__()
         assert (not no_aminoacid_identities) or (lm_embedding_type is None), "no language model emb without identities"
         if parallel > 1: assert affinity_prediction
@@ -53,7 +89,8 @@ class TensorProductScoreModel(torch.nn.Module):
         self.smooth_edges = smooth_edges
         self.odd_parity = odd_parity
         self.num_conv_layers = num_conv_layers
-        self.timestep_emb_func = timestep_emb_func
+        # Change to the default timestep embedding here
+        self.timestep_emb_func = sinusoidal_embedding
         self.separate_noise_schedule = separate_noise_schedule
         self.num_conv_layers = num_conv_layers
         self.asyncronous_noise_schedule = asyncronous_noise_schedule
@@ -65,14 +102,13 @@ class TensorProductScoreModel(torch.nn.Module):
         self.flexible_sidechains = flexible_sidechains
 
         # embedding layers
-        atom_encoder_class = OldAtomEncoder if use_old_atom_encoder else AtomEncoder
-        self.lig_node_embedding = atom_encoder_class(emb_dim=ns, feature_dims=lig_feature_dims, sigma_embed_dim=sigma_embed_dim)
+        self.lig_node_embedding = AtomEncoder(emb_dim=ns, feature_dims=lig_feature_dims, sigma_embed_dim=sigma_embed_dim)
         self.lig_edge_embedding = nn.Sequential(nn.Linear(in_lig_edge_features + sigma_embed_dim + distance_embed_dim, ns),nn.ReLU(),nn.Dropout(dropout),nn.Linear(ns, ns))
 
-        self.rec_node_embedding = atom_encoder_class(emb_dim=ns, feature_dims=rec_residue_feature_dims, sigma_embed_dim=sigma_embed_dim, lm_embedding_type=lm_embedding_type)
+        self.rec_node_embedding = AtomEncoder(emb_dim=ns, feature_dims=rec_residue_feature_dims, sigma_embed_dim=sigma_embed_dim, lm_embedding_type=lm_embedding_type)
         self.rec_edge_embedding = nn.Sequential(nn.Linear(sigma_embed_dim + distance_embed_dim, ns), nn.ReLU(), nn.Dropout(dropout),nn.Linear(ns, ns))
 
-        self.atom_node_embedding = atom_encoder_class(emb_dim=ns, feature_dims=rec_atom_feature_dims, sigma_embed_dim=sigma_embed_dim)
+        self.atom_node_embedding = AtomEncoder(emb_dim=ns, feature_dims=rec_atom_feature_dims, sigma_embed_dim=sigma_embed_dim)
         self.atom_edge_embedding = nn.Sequential(nn.Linear(sigma_embed_dim + distance_embed_dim, ns), nn.ReLU(), nn.Dropout(dropout),nn.Linear(ns, ns))
 
         self.lr_edge_embedding = nn.Sequential(nn.Linear(sigma_embed_dim + cross_distance_embed_dim, ns), nn.ReLU(), nn.Dropout(dropout),nn.Linear(ns, ns))
