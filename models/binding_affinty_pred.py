@@ -61,14 +61,13 @@ class TensorProductScoreModel(torch.nn.Module):
                  scale_by_sigma=True, norm_by_sigma=True, use_second_order_repr=False, batch_norm=True,
                  dynamic_max_cross=False, dropout=0.0, smooth_edges=False, odd_parity=False,
                  separate_noise_schedule=False, lm_embedding_type=False,
-                 confidence_dropout=0, confidence_no_batchnorm = False,
-                 asyncronous_noise_schedule=False, affinity_prediction=False, parallel=1,
-                 parallel_aggregators="mean max min std", num_confidence_outputs=1, fixed_center_conv=False,
+                 confidence_dropout=0,
+                 asyncronous_noise_schedule=False,
+                 parallel_aggregators="mean max min std", fixed_center_conv=False,
                  atom_max_neighbors=None,
-                 no_aminoacid_identities=False, flexible_sidechains=False):
+                flexible_sidechains=False):
         super(TensorProductScoreModel, self).__init__()
-        assert (not no_aminoacid_identities) or (lm_embedding_type is None), "no language model emb without identities"
-        if parallel > 1: assert affinity_prediction
+        assert (lm_embedding_type is None), "no language model emb without identities"
         
         self.in_lig_edge_features = in_lig_edge_features
         sigma_embed_dim *= (3 if separate_noise_schedule else 1)
@@ -92,13 +91,10 @@ class TensorProductScoreModel(torch.nn.Module):
         # Change to the default timestep embedding here
         self.timestep_emb_func = sinusoidal_embedding
         self.separate_noise_schedule = separate_noise_schedule
-        self.num_conv_layers = num_conv_layers
         self.asyncronous_noise_schedule = asyncronous_noise_schedule
-        self.affinity_prediction = affinity_prediction
-        self.parallel, self.parallel_aggregators = parallel, parallel_aggregators.split(' ')
+        self.parallel_aggregators = parallel_aggregators.split(' ')
         self.fixed_center_conv = fixed_center_conv
         self.atom_max_neighbors = atom_max_neighbors
-        self.no_aminoacid_identities = no_aminoacid_identities
         self.flexible_sidechains = flexible_sidechains
 
         # embedding layers
@@ -155,48 +151,29 @@ class TensorProductScoreModel(torch.nn.Module):
 
         self.conv_layers = nn.ModuleList(conv_layers)
 
-        # confidence and affinity prediction layers
-        if self.affinity_prediction:
-            if self.parallel > 1:
-                output_confidence_dim = 1 + ns
-            else:
-                output_confidence_dim = num_confidence_outputs + 1
+        output_dim = 1
+        if num_conv_layers >= 3:
+            confidence_input_dim = 2 * self.ns
         else:
-            output_confidence_dim = num_confidence_outputs
-
-        confidence_input = 2 * self.ns if num_conv_layers >= 3 else self.ns
+            confidence_input_dim = self.ns
         # In the case of flexible sidechains, we also add the atom node embedding as input
-        confidence_input *= 2 if self.flexible_sidechains else 1
-        self.confidence_predictor = nn.Sequential(
-            nn.Linear(confidence_input, ns),
-            nn.BatchNorm1d(ns) if not confidence_no_batchnorm else nn.Identity(),
+        confidence_input_dim *= 2
+        self.affinity_predictor = nn.Sequential(
+            nn.Linear(confidence_input_dim, ns),
+            nn.BatchNorm1d(ns),
             nn.ReLU(),
             nn.Dropout(confidence_dropout),
             nn.Linear(ns, ns),
-            nn.BatchNorm1d(ns) if not confidence_no_batchnorm else nn.Identity(),
+            nn.BatchNorm1d(ns),
             nn.ReLU(),
             nn.Dropout(confidence_dropout),
-            nn.Linear(ns, output_confidence_dim)
+            nn.Linear(ns, output_dim)
         )
 
-        if self.parallel > 1:
-            self.affinity_predictor = nn.Sequential(
-                nn.Linear(len(self.parallel_aggregators) * ns, ns),
-                nn.BatchNorm1d(ns) if not confidence_no_batchnorm else nn.Identity(),
-                nn.ReLU(),
-                nn.Dropout(confidence_dropout),
-                nn.Linear(ns, ns),
-                nn.BatchNorm1d(ns) if not confidence_no_batchnorm else nn.Identity(),
-                nn.ReLU(),
-                nn.Dropout(confidence_dropout),
-                nn.Linear(ns, 1)
-            )
-
     def forward(self, data):
-        if self.no_aminoacid_identities:
-            data['receptor'].x = data['receptor'].x * 0
-
-        tr_sigma, rot_sigma, tor_sigma, sidechain_tor_sigma = [data.complex_t[noise_type] for noise_type in ['tr', 'rot', 'tor', 'sc_tor']]
+        tr_sigma, rot_sigma, tor_sigma, sidechain_tor_sigma = [
+            data.complex_t[noise_type] for noise_type in ['tr', 'rot', 'tor', 'sc_tor']
+        ]
 
         # build ligand graph
         lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh, lig_edge_weight = self.build_lig_conv_graph(data)
@@ -224,86 +201,126 @@ class TensorProductScoreModel(torch.nn.Module):
 
         for l in range(self.num_conv_layers):
             # LIGAND updates
-            lig_edge_attr_ = torch.cat([lig_edge_attr, lig_node_attr[lig_edge_index[0], :self.ns], lig_node_attr[lig_edge_index[1], :self.ns]], -1)
-            lig_update = self.conv_layers[9*l](lig_node_attr, lig_edge_index, lig_edge_attr_, lig_edge_sh, edge_weight=lig_edge_weight)
+            lig_edge_attr_ = torch.cat(
+                [
+                    lig_edge_attr, 
+                    lig_node_attr[lig_edge_index[0], :self.ns], 
+                    lig_node_attr[lig_edge_index[1], :self.ns]
+                ], 
+                -1
+            )
+            lig_update = self.conv_layers[9*l](
+                lig_node_attr, 
+                lig_edge_index, 
+                lig_edge_attr_, 
+                lig_edge_sh, 
+                edge_weight=lig_edge_weight
+            )
 
-            lr_edge_attr_ = torch.cat([lr_edge_attr, lig_node_attr[lr_edge_index[0], :self.ns], rec_node_attr[lr_edge_index[1], :self.ns]], -1)
-            lr_update = self.conv_layers[9*l+1](rec_node_attr, lr_edge_index, lr_edge_attr_, lr_edge_sh,
-                                                out_nodes=lig_node_attr.shape[0], edge_weight=lr_edge_weight)
+            lr_edge_attr_ = torch.cat(
+                [
+                    lr_edge_attr, 
+                    lig_node_attr[lr_edge_index[0], :self.ns], 
+                    rec_node_attr[lr_edge_index[1], :self.ns]
+                ], 
+                -1
+            )
+            lr_update = self.conv_layers[9*l+1](
+                rec_node_attr, lr_edge_index, lr_edge_attr_, lr_edge_sh,
+                out_nodes=lig_node_attr.shape[0], edge_weight=lr_edge_weight
+            )
 
-            la_edge_attr_ = torch.cat([la_edge_attr, lig_node_attr[la_edge_index[0], :self.ns], atom_node_attr[la_edge_index[1], :self.ns]], -1)
-            la_update = self.conv_layers[9*l+2](atom_node_attr, la_edge_index, la_edge_attr_, la_edge_sh,
-                                                out_nodes=lig_node_attr.shape[0], edge_weight=la_edge_weight)
+            la_edge_attr_ = torch.cat(
+                [
+                    la_edge_attr, 
+                    lig_node_attr[la_edge_index[0], :self.ns], 
+                    atom_node_attr[la_edge_index[1], :self.ns]
+                ], 
+                -1
+            )
+            la_update = self.conv_layers[9*l+2](
+                atom_node_attr, la_edge_index, la_edge_attr_, la_edge_sh,
+                out_nodes=lig_node_attr.shape[0], edge_weight=la_edge_weight
+            )
 
             # last layer optimisation
             # normally, we could skip calculating the last atom_attributes etc. in the last layer because they are not needed to predict the ligand (torsions)
             # but for flexible side chains we need the atom update (but not the receptor)
             # this is why we have this flexible_sidechains condition but only for the atom
-            if self.flexible_sidechains or l != self.num_conv_layers - 1:
 
-                # ATOM UPDATES
-                atom_edge_attr_ = torch.cat([atom_edge_attr, atom_node_attr[atom_edge_index[0], :self.ns], atom_node_attr[atom_edge_index[1], :self.ns]], -1)
-                atom_update = self.conv_layers[9*l+3](atom_node_attr, atom_edge_index, atom_edge_attr_, atom_edge_sh, edge_weight=atom_edge_weight)
+            # ATOM UPDATES
+            atom_edge_attr_ = torch.cat([atom_edge_attr, atom_node_attr[atom_edge_index[0], :self.ns], atom_node_attr[atom_edge_index[1], :self.ns]], -1)
+            atom_update = self.conv_layers[9*l+3](atom_node_attr, atom_edge_index, atom_edge_attr_, atom_edge_sh, edge_weight=atom_edge_weight)
 
-                al_edge_attr_ = torch.cat([la_edge_attr, atom_node_attr[la_edge_index[1], :self.ns], lig_node_attr[la_edge_index[0], :self.ns]], -1)
-                al_update = self.conv_layers[9*l+4](lig_node_attr, torch.flip(la_edge_index, dims=[0]), al_edge_attr_,
-                                                    la_edge_sh, out_nodes=atom_node_attr.shape[0], edge_weight=la_edge_weight)
+            al_edge_attr_ = torch.cat([la_edge_attr, atom_node_attr[la_edge_index[1], :self.ns], lig_node_attr[la_edge_index[0], :self.ns]], -1)
+            al_update = self.conv_layers[9*l+4](lig_node_attr, torch.flip(la_edge_index, dims=[0]), al_edge_attr_,
+                                                la_edge_sh, out_nodes=atom_node_attr.shape[0], edge_weight=la_edge_weight)
 
-                ar_edge_attr_ = torch.cat([ar_edge_attr, atom_node_attr[ar_edge_index[0], :self.ns], rec_node_attr[ar_edge_index[1], :self.ns]],-1)
-                ar_update = self.conv_layers[9*l+5](rec_node_attr, ar_edge_index, ar_edge_attr_, ar_edge_sh, out_nodes=atom_node_attr.shape[0], edge_weight=ar_edge_weight)
-
-                if l != self.num_conv_layers - 1:
-                    # RECEPTOR updates
-                    rec_edge_attr_ = torch.cat([rec_edge_attr, rec_node_attr[rec_edge_index[0], :self.ns], rec_node_attr[rec_edge_index[1], :self.ns]], -1)
-                    rec_update = self.conv_layers[9*l+6](rec_node_attr, rec_edge_index, rec_edge_attr_, rec_edge_sh, edge_weight=rec_edge_weight)
-
-                    rl_edge_attr_ = torch.cat([lr_edge_attr, rec_node_attr[lr_edge_index[1], :self.ns], lig_node_attr[lr_edge_index[0], :self.ns]], -1)
-                    rl_update = self.conv_layers[9*l+7](lig_node_attr, torch.flip(lr_edge_index, dims=[0]), rl_edge_attr_,
-                                                        lr_edge_sh, out_nodes=rec_node_attr.shape[0], edge_weight=lr_edge_weight)
-
-                    ra_edge_attr_ = torch.cat([ar_edge_attr, rec_node_attr[ar_edge_index[1], :self.ns], atom_node_attr[ar_edge_index[0], :self.ns]], -1)
-                    ra_update = self.conv_layers[9*l+8](atom_node_attr, torch.flip(ar_edge_index, dims=[0]), ra_edge_attr_,
-                                                        ar_edge_sh, out_nodes=rec_node_attr.shape[0], edge_weight=ar_edge_weight)
+            ar_edge_attr_ = torch.cat([ar_edge_attr, atom_node_attr[ar_edge_index[0], :self.ns], rec_node_attr[ar_edge_index[1], :self.ns]],-1)
+            ar_update = self.conv_layers[9*l+5](rec_node_attr, ar_edge_index, ar_edge_attr_, ar_edge_sh, out_nodes=atom_node_attr.shape[0], edge_weight=ar_edge_weight)
 
             # padding original features and update features with residual updates
             lig_node_attr = F.pad(lig_node_attr, (0, lig_update.shape[-1] - lig_node_attr.shape[-1]))
             lig_node_attr = lig_node_attr + lig_update + la_update + lr_update
 
-            if self.flexible_sidechains or l != self.num_conv_layers - 1:  # last layer optimisation
-                atom_node_attr = F.pad(atom_node_attr, (0, atom_update.shape[-1] - atom_node_attr.shape[-1])) #MERGE rec_node_attr to atom_node_attr
-                atom_node_attr = atom_node_attr + atom_update + al_update + ar_update
+            atom_node_attr = F.pad(atom_node_attr, (0, atom_update.shape[-1] - atom_node_attr.shape[-1])) #MERGE rec_node_attr to atom_node_attr
+            atom_node_attr = atom_node_attr + atom_update + al_update + ar_update
 
-                if l != self.num_conv_layers - 1:
-                    rec_node_attr = F.pad(rec_node_attr, (0, rec_update.shape[-1] - rec_node_attr.shape[-1]))
-                    rec_node_attr = rec_node_attr + rec_update + ra_update + rl_update
+            if l == self.num_conv_layers - 1:
+                break
 
+            # Otherwise, RECEPTOR updates
+            rec_edge_attr_ = torch.cat([rec_edge_attr, rec_node_attr[rec_edge_index[0], :self.ns], rec_node_attr[rec_edge_index[1], :self.ns]], -1)
+            rec_update = self.conv_layers[9*l+6](rec_node_attr, rec_edge_index, rec_edge_attr_, rec_edge_sh, edge_weight=rec_edge_weight)
 
-        num_flexible_bonds = 0 if not self.flexible_sidechains or len(data["flexResidues"]) == 0 else data["flexResidues"].edge_idx.shape[0]
+            rl_edge_attr_ = torch.cat([lr_edge_attr, rec_node_attr[lr_edge_index[1], :self.ns], lig_node_attr[lr_edge_index[0], :self.ns]], -1)
+            rl_update = self.conv_layers[9*l+7](lig_node_attr, torch.flip(lr_edge_index, dims=[0]), rl_edge_attr_,
+                                                lr_edge_sh, out_nodes=rec_node_attr.shape[0], edge_weight=lr_edge_weight)
+
+            ra_edge_attr_ = torch.cat([ar_edge_attr, rec_node_attr[ar_edge_index[1], :self.ns], atom_node_attr[ar_edge_index[0], :self.ns]], -1)
+            ra_update = self.conv_layers[9*l+8](atom_node_attr, torch.flip(ar_edge_index, dims=[0]), ra_edge_attr_,
+                                                ar_edge_sh, out_nodes=rec_node_attr.shape[0], edge_weight=ar_edge_weight)
+            rec_node_attr = F.pad(rec_node_attr, (0, rec_update.shape[-1] - rec_node_attr.shape[-1]))
+            rec_node_attr = rec_node_attr + rec_update + ra_update + rl_update
+
+        num_flexible_bonds = data["flexResidues"].edge_idx.shape[0]
         # confidence and affinity prediction
+        if self.num_conv_layers >= 3:
+            scalar_lig_attr = torch.cat(
+                [lig_node_attr[:, :self.ns], lig_node_attr[:, -self.ns:]], dim=1
+            )
+        else:
+            scalar_lig_attr = lig_node_attr[:, :self.ns]
 
-        scalar_lig_attr = torch.cat([lig_node_attr[:,:self.ns], lig_node_attr[:,-self.ns:]], dim=1) if self.num_conv_layers >= 3 else lig_node_attr[:,:self.ns]
-        scalar_lig_attr = scatter_mean(scalar_lig_attr, data['ligand'].batch if self.parallel == 1 else data['ligand'].batch_parallel, dim=0)
-
+        scalar_lig_attr = scatter_mean(
+            scalar_lig_attr, data['ligand'].batch, dim=0
+        )
         confidence_input = scalar_lig_attr
-
-        if self.flexible_sidechains:
-            if num_flexible_bonds > 0:
-                flexible_atoms = TensorProductScoreModel.get_sc_tor_bonds(data).unique()
-                scalar_atom_node_attr = torch.cat([atom_node_attr[flexible_atoms,:self.ns], atom_node_attr[flexible_atoms,-self.ns:]], dim=1) if self.num_conv_layers >= 3 else atom_node_attr[flexible_atoms,:self.ns]
-                scalar_atom_node_attr = scatter_mean(scalar_atom_node_attr, data['atom'].batch[flexible_atoms] if self.parallel == 1 else data['atom'].batch_parallel[flexible_atoms], dim=0, dim_size=scalar_lig_attr.shape[0])
+        
+        if num_flexible_bonds > 0:
+            flexible_atoms = TensorProductScoreModel.get_sc_tor_bonds(data).unique()
+            if self.num_conv_layers >= 3:
+                scalar_atom_node_attr = torch.cat(
+                    [
+                        atom_node_attr[flexible_atoms,:self.ns], 
+                        atom_node_attr[flexible_atoms,-self.ns:]
+                    ], 
+                    dim=1
+                )
             else:
-                scalar_atom_node_attr = torch.zeros_like(scalar_lig_attr)
-            confidence_input = torch.cat([confidence_input, scalar_atom_node_attr], dim=1)
+                scalar_atom_node_attr = atom_node_attr[flexible_atoms,:self.ns]
+            scalar_atom_node_attr = scatter_mean(
+                scalar_atom_node_attr, 
+                data['atom'].batch[flexible_atoms], 
+                dim=0, 
+                dim_size=scalar_lig_attr.shape[0]
+            )
+        else:
+            scalar_atom_node_attr = torch.zeros_like(scalar_lig_attr)
 
-        confidence = self.confidence_predictor(confidence_input).squeeze(dim=-1)
+        confidence_input = torch.cat([confidence_input, scalar_atom_node_attr], dim=1)
+        confidence = self.affinity_predictor(confidence_input).squeeze(dim=-1)
 
-        if self.parallel > 1:
-            filtering, affinity = confidence[:, 0], confidence[:, 1:]
-            filtering = filtering.reshape(data.num_graphs, self.parallel)
-            affinity = affinity.reshape(data.num_graphs, self.parallel, -1)
-            affinity = torch.cat([AGGREGATORS[agg](affinity) for agg in self.parallel_aggregators], dim=-1)
-            affinity = self.affinity_predictor(affinity).squeeze(dim=-1)
-            confidence = filtering, affinity
         return confidence
 
     def get_edge_weight(self, edge_vec, max_norm):
