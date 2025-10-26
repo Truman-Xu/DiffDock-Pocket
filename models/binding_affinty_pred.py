@@ -67,7 +67,6 @@ class TensorProductScoreModel(torch.nn.Module):
                  atom_max_neighbors=None,
                 flexible_sidechains=False):
         super(TensorProductScoreModel, self).__init__()
-        assert (lm_embedding_type is None), "no language model emb without identities"
         
         self.in_lig_edge_features = in_lig_edge_features
         sigma_embed_dim *= (3 if separate_noise_schedule else 1)
@@ -341,16 +340,8 @@ class TensorProductScoreModel(torch.nn.Module):
             data['ligand'].node_sigma_emb = self.timestep_emb_func(
                 data['ligand'].node_t['tr'])  # tr rot and tor noise is all the same
 
-        if self.parallel == 1:
-            radius_edges = radius_graph(data['ligand'].pos, self.lig_max_radius, data['ligand'].batch)
-        else:
-            batches = torch.zeros(data.num_graphs, device=data['ligand'].x.device).long()
-            batches = batches.index_add(0, data['ligand'].batch, torch.ones(len(data['ligand'].batch), device=data['ligand'].x.device).long())
-            outer_batches = data.num_graphs
-            b = [torch.ones(batches[i].item()//self.parallel, device=data['ligand'].x.device).long() * (self.parallel * i + j)
-                 for i in range(outer_batches) for j in range(self.parallel)]
-            data['ligand'].batch_parallel = torch.cat(b)
-            radius_edges = radius_graph(data['ligand'].pos, self.lig_max_radius, data['ligand'].batch_parallel)
+        
+        radius_edges = radius_graph(data['ligand'].pos, self.lig_max_radius, data['ligand'].batch)
         edge_index = torch.cat([data['ligand', 'ligand'].edge_index, radius_edges], 1).long()
         edge_attr = torch.cat([
             data['ligand', 'ligand'].edge_attr,
