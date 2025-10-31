@@ -3,6 +3,8 @@ data/PDBBIND_atomCorrected/
 workdir/
 furyal_docked_poses/
 notebooks/
+subsample_graphs/
+*.npy
 
 # Created by https://www.toptal.com/developers/gitignore/api/python,pycharm+all
 # Edit at https://www.toptal.com/developers/gitignore?templates=python,pycharm+all
