@@ -54,13 +54,12 @@ def sinusoidal_embedding(timesteps, dim=32, scale=10000, max_positions=10000):
 # affinity_pred.load_state_dict(state_dict, strict=True)
 # affinity_pred = affinity_pred.to(device)
 # affinity_pred.eval()
-
 class TensorProductScoreModel(torch.nn.Module):
     def __init__(self, device, in_lig_edge_features=4, sigma_embed_dim=32, sh_lmax=2,
                  ns=16, nv=4, num_conv_layers=2, lig_max_radius=5, rec_max_radius=30, cross_max_distance=250,
                  center_max_distance=30, distance_embed_dim=32, cross_distance_embed_dim=32, no_torsion=False,
                  scale_by_sigma=True, norm_by_sigma=True, use_second_order_repr=False, batch_norm=True,
-                 dropout=0.0, smooth_edges=False, odd_parity=False,
+                 dynamic_max_cross=False, dropout=0.0, smooth_edges=False, odd_parity=False,
                  separate_noise_schedule=False, lm_embedding_type=False,
                  confidence_dropout=0,
                  asyncronous_noise_schedule=False,
@@ -75,6 +74,7 @@ class TensorProductScoreModel(torch.nn.Module):
         self.lig_max_radius = lig_max_radius
         self.rec_max_radius = rec_max_radius
         self.cross_max_distance = cross_max_distance
+        self.dynamic_max_cross = dynamic_max_cross
         self.center_max_distance = center_max_distance
         self.distance_embed_dim = distance_embed_dim
         self.cross_distance_embed_dim = cross_distance_embed_dim
@@ -170,6 +170,10 @@ class TensorProductScoreModel(torch.nn.Module):
         )
 
     def forward(self, data):
+        tr_sigma, rot_sigma, tor_sigma, sidechain_tor_sigma = [
+            data.complex_t[noise_type] for noise_type in ['tr', 'rot', 'tor', 'sc_tor']
+        ]
+
         # build ligand graph
         lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh, lig_edge_weight = self.build_lig_conv_graph(data)
         lig_node_attr = self.lig_node_embedding(lig_node_attr)
@@ -186,7 +190,7 @@ class TensorProductScoreModel(torch.nn.Module):
         atom_edge_attr = self.atom_edge_embedding(atom_edge_attr)
 
         # build cross graph
-        cross_cutoff = self.cross_max_distance
+        cross_cutoff = (tr_sigma * 3 + 20).unsqueeze(1) if self.dynamic_max_cross else self.cross_max_distance
         lr_edge_index, lr_edge_attr, lr_edge_sh, lr_edge_weight, la_edge_index, la_edge_attr, \
             la_edge_sh, la_edge_weight, ar_edge_index, ar_edge_attr, ar_edge_sh, ar_edge_weight = \
             self.build_cross_conv_graph(data, cross_cutoff)
