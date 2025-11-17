@@ -211,9 +211,9 @@ def get_complex_graph(
     else:
         accept_atom_function = _get_flexdist_cutoff_func(
             rec_atoms_for_pocket, complex_graph['ligand'].pos,
-            flexdist=3.5, 
+            flexdist=7.0, 
             mode='prism',
-            pocket_cutoff=5.0
+            pocket_cutoff=10.0
         )
 
     complex_graph = set_sidechain_rotation_masks(
