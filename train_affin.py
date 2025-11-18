@@ -150,25 +150,23 @@ def ddp_train(rank, world_size, model, n_epochs, batch_size, data_dir, model_dir
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=10)
     # --- Training Loop ---
     for epoch in tqdm(range(n_epochs), disable=(rank != 0)):
+        problem_batches = []
         model.train()
         for batch in tqdm(train_loader, disable=(rank != 0)):
             batch.to(rank)
-            set_time(
-                batch,
-                0, 0, 0, 0, 0,
-                batchsize=batch_size, all_atoms=True,
-                asyncronous_noise_schedule=False, device=rank,
-                include_miscellaneous_atoms=False
-            )
             optimizer.zero_grad()
             logits = model(batch)
             loss = criterion(logits.squeeze(), batch.y)
             if torch.any(torch.isnan(loss)) or torch.any(torch.isinf(loss)):
                 print(batch.name , batch.y, logits)
+                problem_batches.append(batch.name)
                 continue
             loss.backward()
             optimizer.step()
-        print(f"Rank {rank}, Epoch {epoch}, Loss: {loss / len(train_loader)}")
+        print(
+            f"Rank {rank}, Epoch {epoch}, Loss: {loss / len(train_loader)}, "
+            f"Problem Batches: {len(problem_batches)}"
+        )
 
         model.eval()
         all_preds, all_labels = [], []
@@ -177,13 +175,6 @@ def ddp_train(rank, world_size, model, n_epochs, batch_size, data_dir, model_dir
         with torch.no_grad():
             for batch in val_loader:
                 batch.to(rank)
-                set_time(
-                    batch,
-                    0, 0, 0, 0, 0,
-                    batchsize=batch_size, all_atoms=True,
-                    asyncronous_noise_schedule=False, device=rank,
-                    include_miscellaneous_atoms=False
-                )
                 logits = model(batch)
                 loss = criterion(logits.squeeze(), batch.y)
                 if torch.any(torch.isnan(loss)) or torch.any(torch.isinf(loss)):
@@ -192,7 +183,6 @@ def ddp_train(rank, world_size, model, n_epochs, batch_size, data_dir, model_dir
                     problem_batches.append(batch.name)
                     continue
                 total_val_loss += loss.item()
-                
                 probs = torch.sigmoid(logits).cpu().numpy()
                 labels = batch.y.cpu().numpy()
                 all_preds.extend(probs)
